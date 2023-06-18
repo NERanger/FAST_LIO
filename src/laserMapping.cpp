@@ -91,9 +91,10 @@ double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min
 double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
 int    effct_feat_num = 0, time_log_counter = 0, scan_count = 0, publish_count = 0;
 int    iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
+int localmap_win_size = 0;
 bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
-bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
+bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false, localmap_bodyframe_pub_en = false;
 
 vector<vector<int>>  pointSearchInd_surf; 
 vector<BoxPointType> cub_needrm;
@@ -103,6 +104,7 @@ vector<double>       extrinR(9, 0.0);
 deque<double>                     time_buffer;
 deque<PointCloudXYZI::Ptr>        lidar_buffer;
 deque<sensor_msgs::Imu::ConstPtr> imu_buffer;
+deque<PointCloudXYZI::Ptr>        local_map_buffer;  // in world frame
 
 PointCloudXYZI::Ptr featsFromMap(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_undistort(new PointCloudXYZI());
@@ -204,6 +206,17 @@ void RGBpointBodyToWorld(PointType const * const pi, PointType * const po)
     po->x = p_global(0);
     po->y = p_global(1);
     po->z = p_global(2);
+    po->intensity = pi->intensity;
+}
+
+void RGBpointWorldToBodyLidar(PointType const * const pi, PointType * const po)
+{
+    V3D p_global(pi->x, pi->y, pi->z);
+    V3D p_body(state_point.rot.inverse() * (p_global - state_point.pos));
+
+    po->x = p_body(0);
+    po->y = p_body(1);
+    po->z = p_body(2);
     po->intensity = pi->intensity;
 }
 
@@ -543,6 +556,27 @@ void publish_frame_body(const ros::Publisher & pubLaserCloudFull_body)
     publish_count -= PUBFRAME_PERIOD;
 }
 
+void publish_localmap_body(const ros::Publisher & pub)
+{
+    PointCloudXYZI::Ptr localMapWorld(new PointCloudXYZI());
+    for(const PointCloudXYZI::Ptr &cloud : local_map_buffer)
+    {
+        *localMapWorld += *cloud;
+    }
+
+    PointCloudXYZI::Ptr localMapBodyLidar(new PointCloudXYZI(localMapWorld->size(), 1));
+    for(int i = 0; i < localMapBodyLidar->size(); i++){
+        RGBpointWorldToBodyLidar(&localMapWorld->points[i], &localMapBodyLidar->points[i]);
+    }
+
+    sensor_msgs::PointCloud2 localMapMsg;
+    pcl::toROSMsg(*localMapBodyLidar, localMapMsg);
+    localMapMsg.header.stamp = ros::Time().fromSec(lidar_end_time);
+    localMapMsg.header.frame_id = "body";
+    pub.publish(localMapMsg);
+
+}
+
 void publish_effect_world(const ros::Publisher & pubLaserCloudEffect)
 {
     PointCloudXYZI::Ptr laserCloudWorld( \
@@ -748,6 +782,23 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     solve_time += omp_get_wtime() - solve_start_;
 }
 
+void add_local_map()
+{
+    PointCloudXYZI::Ptr featsUndistortWorld(new PointCloudXYZI(feats_undistort->size(), 1));
+
+    for (int i = 0; i < feats_undistort->size(); i++)
+    {
+        RGBpointBodyToWorld(&feats_undistort->points[i], &featsUndistortWorld->points[i]);
+    }
+
+    local_map_buffer.push_back(featsUndistortWorld);
+
+    while (local_map_buffer.size() > localmap_win_size)
+    {
+        local_map_buffer.pop_front();
+    }
+}
+
 int main(int argc, char** argv)
 {
     ros::init(argc, argv, "laserMapping");
@@ -757,6 +808,8 @@ int main(int argc, char** argv)
     nh.param<bool>("publish/scan_publish_en",scan_pub_en, true);
     nh.param<bool>("publish/dense_publish_en",dense_pub_en, true);
     nh.param<bool>("publish/scan_bodyframe_pub_en",scan_body_pub_en, true);
+    nh.param<bool>("publish/localmap_bodyframe_pub_en",localmap_bodyframe_pub_en, true);
+    nh.param<int>("localmap/window_size",localmap_win_size, 10);
     nh.param<int>("max_iteration",NUM_MAX_ITERATIONS,4);
     nh.param<string>("map_file_path",map_file_path,"");
     nh.param<string>("common/lid_topic",lid_topic,"/livox/lidar");
@@ -845,6 +898,8 @@ int main(int argc, char** argv)
             ("/cloud_registered_body", 100000);
     ros::Publisher pubLaserCloudEffect = nh.advertise<sensor_msgs::PointCloud2>
             ("/cloud_effected", 100000);
+    ros::Publisher pubLocalMapBody = nh.advertise<sensor_msgs::PointCloud2>
+            ("/cloud_local_map_body_lidar", 100000);
     ros::Publisher pubLaserCloudMap = nh.advertise<sensor_msgs::PointCloud2>
             ("/Laser_map", 100000);
     ros::Publisher pubOdomAftMapped = nh.advertise<nav_msgs::Odometry> 
@@ -961,6 +1016,9 @@ int main(int argc, char** argv)
 
             double t_update_end = omp_get_wtime();
 
+            /******* local map *******/
+            add_local_map();
+
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped);
 
@@ -973,6 +1031,7 @@ int main(int argc, char** argv)
             if (path_en)                         publish_path(pubPath);
             if (scan_pub_en || pcd_save_en)      publish_frame_world(pubLaserCloudFull);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body);
+            if (scan_pub_en && localmap_bodyframe_pub_en) publish_localmap_body(pubLocalMapBody);
             // publish_effect_world(pubLaserCloudEffect);
             // publish_map(pubLaserCloudMap);
 
